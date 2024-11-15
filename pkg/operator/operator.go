@@ -93,6 +93,7 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 	ackProvider := ack.NewDefaultProvider(clusterID, ackClient)
 
 	instanceProvider := instance.NewDefaultProvider(
+		ctx,
 		region,
 		ecsClient,
 		imageResolver,

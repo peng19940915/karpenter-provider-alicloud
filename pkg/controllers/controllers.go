@@ -32,6 +32,7 @@ import (
 	"github.com/cloudpilot-ai/karpenter-provider-alibabacloud/pkg/controllers/interruption"
 	nodeclaimgarbagecollection "github.com/cloudpilot-ai/karpenter-provider-alibabacloud/pkg/controllers/nodeclaim/garbagecollection"
 	nodeclaimtagging "github.com/cloudpilot-ai/karpenter-provider-alibabacloud/pkg/controllers/nodeclaim/tagging"
+	nodeclaimunregisteredtaint "github.com/cloudpilot-ai/karpenter-provider-alibabacloud/pkg/controllers/nodeclaim/unregisteredtaint"
 	nodeclasshash "github.com/cloudpilot-ai/karpenter-provider-alibabacloud/pkg/controllers/nodeclass/hash"
 	nodeclaasstatus "github.com/cloudpilot-ai/karpenter-provider-alibabacloud/pkg/controllers/nodeclass/status"
 	nodeclasstermination "github.com/cloudpilot-ai/karpenter-provider-alibabacloud/pkg/controllers/nodeclass/termination"
@@ -62,6 +63,7 @@ func NewControllers(ctx context.Context, mgr manager.Manager, clk clock.Clock, r
 		nodeclasstermination.NewController(kubeClient, recorder),
 		controllerspricing.NewController(pricingProvider),
 		nodeclaimgarbagecollection.NewController(kubeClient, cloudProvider),
+		nodeclaimunregisteredtaint.NewController(kubeClient),
 		nodeclaimtagging.NewController(kubeClient, instanceProvider),
 		providersinstancetype.NewController(instanceTypeProvider),
 	}

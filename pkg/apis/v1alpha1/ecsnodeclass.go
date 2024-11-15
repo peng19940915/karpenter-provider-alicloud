@@ -34,6 +34,15 @@ type ECSNodeClassSpec struct {
 	// +kubebuilder:validation:MaxItems:=30
 	// +required
 	VSwitchSelectorTerms []VSwitchSelectorTerm `json:"vSwitchSelectorTerms" hash:"ignore"`
+	// ECSCreateQPS is the QPS limit for creating instances.
+	// +kubebuilder:validation:Minimum:=1
+	// +kubebuilder:validation:Maximum:=100
+	// +kubebuilder:default:=60
+	ECSCreateQPS *int32 `json:"eCSCreateQPS,omitempty"`
+	// VSwitchSelectionPolicy is the policy to select the vSwitch.
+	// +kubebuilder:validation:Enum:=balanced;cheapest
+	// +kubebuilder:default:=cheapest
+	VSwitchSelectionPolicy string `json:"vSwitchSelectionPolicy,omitempty"`
 	// SecurityGroupSelectorTerms is a list of or security group selector terms. The terms are ORed.
 	// +kubebuilder:validation:XValidation:message="securityGroupSelectorTerms cannot be empty",rule="self.size() != 0"
 	// +kubebuilder:validation:XValidation:message="expected at least one, got none, ['tags', 'id', 'name']",rule="self.all(x, has(x.tags) || has(x.id) || has(x.name))"

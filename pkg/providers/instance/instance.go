@@ -18,17 +18,21 @@ package instance
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"net/http"
 	"strings"
+	"sync"
 
 	ecsclient "github.com/alibabacloud-go/ecs-20140526/v4/client"
 	util "github.com/alibabacloud-go/tea-utils/v2/service"
 	"github.com/alibabacloud-go/tea/tea"
 	"github.com/samber/lo"
 	"go.uber.org/multierr"
+	"golang.org/x/time/rate"
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -59,30 +63,38 @@ type Provider interface {
 }
 
 type DefaultProvider struct {
-	ecsClient *ecsclient.Client
-	region    string
-
+	ecsClient           *ecsclient.Client
+	region              string
 	imageFamilyResolver imagefamily.Resolver
 	vSwitchProvider     vswitch.Provider
 	ackProvider         ack.Provider
+	createLimiter       *rate.Limiter
+	instanceM           sync.Map
 }
 
-func NewDefaultProvider(region string, ecsClient *ecsclient.Client,
+func NewDefaultProvider(ctx context.Context, region string, ecsClient *ecsclient.Client,
 	imageFamilyResolver imagefamily.Resolver, vSwitchProvider vswitch.Provider,
 	ackProvider ack.Provider) *DefaultProvider {
-	return &DefaultProvider{
-		ecsClient: ecsClient,
-		region:    region,
-
+	p := &DefaultProvider{
+		ecsClient:           ecsClient,
+		region:              region,
+		createLimiter:       rate.NewLimiter(rate.Limit(1), options.FromContext(ctx).ECSCreateQPS),
 		imageFamilyResolver: imageFamilyResolver,
 		vSwitchProvider:     vSwitchProvider,
 		ackProvider:         ackProvider,
 	}
+
+	return p
 }
 
 func (p *DefaultProvider) Create(ctx context.Context, nodeClass *v1alpha1.ECSNodeClass, nodeClaim *karpv1.NodeClaim,
 	instanceTypes []*cloudprovider.InstanceType,
 ) (*Instance, error) {
+	// Wait for rate limiter
+	if err := p.createLimiter.Wait(ctx); err != nil {
+		log.FromContext(ctx).Error(err, "rate limit exceeded")
+		return nil, fmt.Errorf("rate limit exceeded: %w", err)
+	}
 	schedulingRequirements := scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaim.Spec.Requirements...)
 	// Only filter the instances if there are no minValues in the requirement.
 	if !schedulingRequirements.HasMinValues() {
@@ -100,7 +112,6 @@ func (p *DefaultProvider) Create(ctx context.Context, nodeClass *v1alpha1.ECSNod
 
 	return NewInstanceFromProvisioningGroup(launchInstance, createAutoProvisioningGroupRequest, p.region), nil
 }
-
 func (p *DefaultProvider) Get(ctx context.Context, id string) (*Instance, error) {
 	describeInstancesRequest := &ecsclient.DescribeInstancesRequest{
 		RegionId:    tea.String(p.region),
@@ -354,6 +365,7 @@ func (p *DefaultProvider) launchInstance(ctx context.Context, nodeClass *v1alpha
 	}
 
 	runtime := &util.RuntimeOptions{}
+
 	resp, err := p.ecsClient.CreateAutoProvisioningGroupWithOptions(createAutoProvisioningGroupRequest, runtime)
 	if err != nil {
 		return nil, nil, fmt.Errorf("creating auto provisioning group, %w", err)
@@ -362,7 +374,11 @@ func (p *DefaultProvider) launchInstance(ctx context.Context, nodeClass *v1alpha
 	if err := createAutoProvisioningGroupResponseHandler(resp); err != nil {
 		return nil, nil, err
 	}
-
+	if len(resp.Body.LaunchResults.LaunchResult) == 0 || resp.Body.LaunchResults.LaunchResult[0].InstanceIds == nil ||
+		len(resp.Body.LaunchResults.LaunchResult[0].InstanceIds.InstanceId) == 0 {
+		return nil, nil, fmt.Errorf("failed to launch instance, requestId: %s, code: %s, message: %s", tea.StringValue(resp.Body.RequestId),
+			tea.StringValue(resp.Body.LaunchResults.LaunchResult[0].ErrorCode), tea.StringValue(resp.Body.LaunchResults.LaunchResult[0].ErrorMsg))
+	}
 	return resp.Body.LaunchResults.LaunchResult[0], createAutoProvisioningGroupRequest, nil
 }
 
@@ -454,7 +470,7 @@ func (p *DefaultProvider) getProvisioningGroup(ctx context.Context, nodeClass *v
 			break
 		}
 
-		vSwitchID := p.getVSwitchID(instanceType, zonalVSwitchs, requirements, capacityType)
+		vSwitchID := p.getVSwitchID(instanceType, zonalVSwitchs, requirements, capacityType, nodeClass.Spec.VSwitchSelectionPolicy)
 		if vSwitchID == "" {
 			return nil, errors.New("vSwitchID not found")
 		}
@@ -554,23 +570,28 @@ func (p *DefaultProvider) checkODFallback(nodeClaim *karpv1.NodeClaim, instanceT
 }
 
 func (p *DefaultProvider) getVSwitchID(instanceType *cloudprovider.InstanceType,
-	zonalVSwitchs map[string]*vswitch.VSwitch, reqs scheduling.Requirements, capacityType string) string {
+	zonalVSwitchs map[string]*vswitch.VSwitch, reqs scheduling.Requirements, capacityType string, vSwitchSelectionPolicy string) string {
 	cheapestVSwitchID := ""
 	cheapestPrice := math.MaxFloat64
 
+	if capacityType == karpv1.CapacityTypeOnDemand || vSwitchSelectionPolicy == v1alpha1.VSwitchSelectionPolicyBalanced {
+		// For on-demand, randomly select a zone's vswitch
+		zoneIDs := lo.Keys(zonalVSwitchs)
+		if len(zoneIDs) > 0 {
+			randomIndex, _ := rand.Int(rand.Reader, big.NewInt(int64(len(zoneIDs))))
+			return zonalVSwitchs[zoneIDs[randomIndex.Int64()]].ID
+		}
+	}
 	// For different AZ, the spot price may differ. So we need to get the cheapest vSwitch in the zone
 	for i := range instanceType.Offerings {
 		if reqs.Compatible(instanceType.Offerings[i].Requirements, scheduling.AllowUndefinedWellKnownLabels) != nil {
 			continue
 		}
+
 		vswitch, ok := zonalVSwitchs[instanceType.Offerings[i].Requirements.Get(corev1.LabelTopologyZone).Any()]
 		if !ok {
 			continue
 		}
-		if capacityType == karpv1.CapacityTypeOnDemand {
-			return vswitch.ID
-		}
-
 		if instanceType.Offerings[i].Price < cheapestPrice {
 			cheapestVSwitchID = vswitch.ID
 			cheapestPrice = instanceType.Offerings[i].Price
@@ -585,4 +606,32 @@ type LaunchTemplate struct {
 	ImageID          string
 	SecurityGroupIds []*string
 	SystemDisk       *v1alpha1.SystemDisk
+}
+
+func (p *DefaultProvider) getInstance(id string) (*Instance, error) {
+	describeInstancesRequest := &ecsclient.DescribeInstancesRequest{
+		RegionId:    tea.String(p.region),
+		InstanceIds: tea.String("[\"" + id + "\"]"),
+	}
+	runtime := &util.RuntimeOptions{}
+
+	resp, err := p.ecsClient.DescribeInstancesWithOptions(describeInstancesRequest, runtime)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp == nil || resp.Body == nil || resp.Body.Instances == nil {
+		return nil, fmt.Errorf("failed to get instance %s", id)
+	}
+
+	// If the instance size is 0, which means it's deleted, return notfound error
+	if len(resp.Body.Instances.Instance) == 0 {
+		return nil, cloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("expected a single instance with id %s", id))
+	}
+
+	if len(resp.Body.Instances.Instance) != 1 {
+		return nil, fmt.Errorf("expected a single instance with id %s, got %d", id, len(resp.Body.Instances.Instance))
+	}
+
+	return NewInstance(resp.Body.Instances.Instance[0]), nil
 }

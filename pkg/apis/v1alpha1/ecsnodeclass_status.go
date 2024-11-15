@@ -26,6 +26,8 @@ const (
 	ConditionTypeSecurityGroupsReady = "SecurityGroupsReady"
 	ConditionTypeInstanceRAMReady    = "InstanceRAMReady"
 	ConditionTypeImagesReady         = "ImagesReady"
+	VSwitchSelectionPolicyBalanced   = "balanced"
+	VSwitchSelectionPolicyCheapest   = "cheapest"
 )
 
 // VSwitch contains resolved VSwitch selector values utilized for node launch
